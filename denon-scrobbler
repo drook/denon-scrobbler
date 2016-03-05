@@ -1,0 +1,365 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use WWW::Curl::Easy;
+use Digest::MD5 qw(md5 md5_hex md5_base64);
+use HTML::Entities;
+use URI::Escape;
+
+#===================
+my $version = "1.06";
+my $lfmcurl;
+my $rcvcurl;
+my $response_body;
+my $response_code;
+my $retcode;
+
+my $artist;
+my $album;
+my $track;
+my $lasttrack = "";
+
+my @response;
+my @tmp;
+
+my $loader = [ '/', '-', '\\', '|' ];
+my $submitted = 0;
+my $played = 0;
+my $logfile;
+my $logfilepath = "scrobbler.log";
+my $report;
+my $passcount;
+my $k;
+my $debug = 0;
+
+my $denonaddress = "YOUR DENON UNIT IP ADDRESS";
+my $rooturl = "http://ws.audioscrobbler.com/2.0/";
+my $apikey = "5ba331f73224ea368e737cdf45dcd2d9";
+my $secret = "58e7cfed2aebcaf6458b5e80aedfca33";
+my $query;
+my $username = "YOUR USERNAME";
+my $password = "YOUR LAST.FM PASSWORD MD5 HASH HERE";
+my $authtoken;
+my $signature;
+my $i;
+my $j;
+my $bodyfound;
+my @sessionbody;
+my $sessionkey;
+
+my @responsebody;
+my @scrobblebody;
+
+my $scrobblemsg;
+my $scrobblesignature;
+my $starttime;
+my $playingflag;
+
+my $encodedartist;
+my $encodedalbum;
+my $encodedtrack;
+my $playing;
+my $string2clear = 0;
+#===================
+
+open($logfile, ">>", $logfilepath) or die "Cannot open $logfile for writing.\n";
+
+$lfmcurl = WWW::Curl::Easy->new;
+$lfmcurl -> setopt(CURLOPT_HEADER,1);
+
+# handshaking with last.fm
+$authtoken = md5_hex($username.$password);
+$signature = "api_key".$apikey."authToken".$authtoken."methodauth.getMobileSessionusername".$username.$secret;
+$query = "method=auth.getMobileSession&username=".$username."&authToken=".$authtoken."&api_key=".$apikey."&api_sig=".md5_hex($signature);
+$lfmcurl->setopt(WWW::Curl::Easy::CURLOPT_POST(), 1);
+$lfmcurl->setopt(CURLOPT_URL, $rooturl);
+$lfmcurl->setopt(CURLOPT_POSTFIELDS, $query);
+$lfmcurl->setopt(CURLOPT_WRITEDATA,\$response_body);
+$retcode = $lfmcurl->perform;
+if ($retcode == 0) {
+    if ($debug > 1) {
+        print $logfile "Transfer went ok.\n";
+    }
+    $response_code = $lfmcurl->getinfo(CURLINFO_HTTP_CODE);
+    if ($debug > 1) {
+        print $logfile "Response code from last.fm: ", $response_code, ".\n";
+    }
+    if ( $response_code == 200) {
+	@response = split(/\n/,$response_body);
+	# we're searching for the first line of body
+	$i = 0;
+	$bodyfound = 0;
+	while ($i < @response) {
+	    $response[$i] =~ s/\r|\n//g;
+	    if ($response[$i] eq "") {
+		$bodyfound = 1;
+	    }
+	    if ($bodyfound == 1 and $response[$i] ne "") {
+		push @sessionbody, $response[$i];
+	    }
+	    $i++;
+	}
+	if ($sessionbody[1] eq "<lfm status=\"ok\">") {
+	    # we have our key
+	    $sessionkey = $sessionbody[4];
+	    @tmp = split(/\<key\>|\<\/key\>/, $sessionkey);
+	    $sessionkey = $tmp[1];
+	    print $logfile "Session key: ", $sessionkey, "\n";
+	} else {
+	    print $logfile "last.fm handshake failed: ", $sessionbody[0], "\n";
+	    $i = 0;
+	    while ($i < @sessionbody) {
+		print $logfile $sessionbody[$i], "\n";
+		$i++;
+	    }
+	    exit(1);
+	}
+    } else {
+	print $logfile "Received ".$response_code." from last.fm.\n";
+	exit(1);
+    }
+} else {
+    print $logfile "Cannot connect to last.fm: $retcode ".$lfmcurl->strerror($retcode)." ".$lfmcurl->errbuf."\n";
+    $lfmcurl -> curl_easy_cleanup;
+    exit(1);
+}
+
+$rcvcurl = WWW::Curl::Easy -> new;
+$rcvcurl -> setopt(CURLOPT_HEADER,1);
+$rcvcurl -> setopt(CURLOPT_URL, 'http://'.$denonaddress.'/goform/formNetAudio_StatusXml.xml?ZoneName=MAIN+ZONE');
+$rcvcurl -> setopt(CURLOPT_WRITEDATA,\$response_body);
+
+select($logfile);
+$| = 1;
+select(STDOUT);
+$| = 1;
+
+$passcount = 0;
+$playing = 0;
+#print STDOUT "\n";
+while (1 == 1) {
+    if ($playing == 1) {
+	if (defined($album)) {
+	    $report = " [Playing: ".$artist."[".$album."]/".$track.", $played played, $submitted submitted]";
+	} else {
+	    $report = " [Playing: ".$artist."/".$track.", $played played, $submitted submitted]";
+	}
+    } else {
+	$report = " [Stopped, $played played, $submitted submitted]";
+    }
+    # move the cursor backwards
+    $k = 0;
+    while($k <= $string2clear) {
+	if ($played > 0) {
+    	    print STDOUT "\b";
+	}
+	$k++;
+    }
+    print STDOUT $loader -> [$passcount % 4], $report;
+    # if string to print is shorter than previous, we'll fill the rest with spaces
+    if (length($report) < $string2clear) {
+	$k = 0;
+	while ($k < $string2clear - length($report)) {
+	    print STDOUT " ";
+	    $k++
+	}
+	$k = 0;
+	while ($k < $string2clear - length($report)) {
+	    print STDOUT "\b";
+	    $k++;
+	}
+    }
+    $string2clear = length($report);
+    $passcount++;
+
+    undef($response_body);
+    $retcode = $rcvcurl -> perform;
+    if ($retcode == 0) {
+	if ($debug > 1) {
+	    print $logfile "Transfer went ok.\n";
+	    if ($debug > 2) {
+		print $logfile $response_body;
+	    }
+	}
+	$response_code = $rcvcurl->getinfo(CURLINFO_HTTP_CODE);
+	if ($debug > 1) {
+	    print $logfile "Response code from receiver: ", $response_code, "\n";
+	}
+	if ($response_code == 200) {
+	    @response = split(/\n/,$response_body);
+	    if ($debug > 1) {
+		print $logfile "Received response from receiver: ".$response[0]."\n";
+	    }
+	    unless ($response[0] eq "HTTP/1.1 404 Not Found") {
+		if ($debug > 1) {
+		    print $logfile "Found some info.\n";
+		}
+
+		# stripping headers from body
+		$j = 0;
+		$bodyfound = 0;
+		undef(@responsebody);
+		while ($j < @response) {
+		    $response[$j] =~ s/\r|\n//g;
+		    if ($response[$j] eq "") {
+			$bodyfound = 1;
+		    }
+		    if ($bodyfound == 1 and $response[$j] ne "") {
+			push @responsebody, $response[$j];
+		    }
+		    $j++;
+		}
+
+		if ($debug > 2) {
+		    print $logfile "First body line: ", $responsebody[0], "\n";
+		    print $logfile "Track line: ", $responsebody[17], "\n";
+		    print $logfile "Artist line: ", $responsebody[18], "\n";
+		    print $logfile "Album line: ", $responsebody[20], "\n";
+		}
+
+		@tmp = split(/\<value\>|\<\/value\>/,$responsebody[16]);
+		$playingflag = decode_entities($tmp[1]);
+		@tmp = split(/\<value\>|\<\/value\>/,$responsebody[17]);
+		if (defined($tmp[1])) {
+		    $track = decode_entities($tmp[1]);
+		} else {
+		    $track = "";
+		}
+		@tmp = split(/\<value\>|\<\/value\>/,$responsebody[18]);
+		if (defined($tmp[1])) {
+		    $artist = decode_entities($tmp[1]);
+		} else {
+		    $artist = "";
+		}
+		@tmp = split(/\<value\>|\<\/value\>/,$responsebody[20]);
+		if (defined($tmp[1])) {
+		    $album = decode_entities($tmp[1]);
+		} else {
+		    $album = "";
+		}
+
+		# for some reason &apos; isn't decoded
+		$album =~ s/\&apos\;/\'/g;
+		$track =~ s/\&apos\;/\'/g;
+		$artist =~ s/\&apos\;/\'/g;
+		
+		# &amp; too
+		$album =~ s/\&amp\;/\&/g;
+		$track =~ s/\&amp\;/\&/g;
+		$artist =~ s/\&amp\;/\&/g;
+		
+		if ($debug > 1 and (defined($artist) or defined($track) or defined($album))) {
+		    print $logfile "Artist: ".$artist."\n";
+		    print $logfile "Album: ".$album."\n";
+		    print $logfile "Track: ".$track."\n";
+		}
+		
+		if(defined($track) and ($track ne "" and $track ne $lasttrack) and $playingflag eq "Now Playing") {
+		    $playing = 1;
+		    # we need to scrobble
+		    if ($debug > 1) {
+			print $logfile "We need to scrobble!\n";
+		    }
+		    $lasttrack = $track;
+		    $played++;
+
+		    $starttime = time();
+
+		    $encodedartist = uri_escape($artist);
+		    $encodedalbum = uri_escape($album);
+		    $encodedtrack = uri_escape($track);
+
+		    $scrobblemsg = "album=".$encodedalbum.
+				    "&api_key=".$apikey.
+				    "&artist=".$encodedartist.
+				    "&method=track.Scrobble".
+				    "&timestamp=".$starttime.
+				    "&track=".$encodedtrack.
+				    "&sk=".$sessionkey;
+
+		    $scrobblesignature = "album".$album.
+					"api_key".$apikey.
+					"artist".$artist.
+					"methodtrack.Scrobble".
+					"sk".$sessionkey.
+					"timestamp".$starttime.
+					"track".$track.
+					$secret;
+		    $scrobblemsg = $scrobblemsg."&api_sig=".md5_hex($scrobblesignature);
+
+		    if ($debug > 1) {
+			print $logfile "Scrobble message: ", $scrobblemsg, "\n";
+		    }
+
+		    undef($response_body);
+
+		    print $logfile "Scrobbling track ".$artist."/".$track." from album [".$album."].\n";
+
+		    $lfmcurl->setopt(CURLOPT_POSTFIELDS, $scrobblemsg);
+		    $lfmcurl->setopt(CURLOPT_WRITEDATA,\$response_body);
+		    $retcode = $lfmcurl->perform;
+
+		    if ($debug > 1) {
+			print $logfile "Scrobble return code: ", $retcode, "\n";
+		    }
+		    if ($retcode == 0) {
+			if ( $response_code == 200) {
+			    @response = split(/\n/,$response_body);
+			    # we're searching for the first line of body
+			    $i = 0;
+			    $bodyfound = 0;
+			    undef(@scrobblebody);
+			    while ($i < @response) {
+				$response[$i] =~ s/\r|\n//g;
+				if ($response[$i] eq "") {
+				    $bodyfound = 1;
+				}
+				if ($bodyfound == 1 and $response[$i] ne "") {
+				    push @scrobblebody, $response[$i];
+				}
+				$i++;
+			    }
+			    if ($scrobblebody[1] eq "<lfm status=\"ok\">") {
+				# we have our answer
+				print $logfile "last.fm scrobbling succeeded: ", $scrobblebody[0], "\n";
+				if ($debug > 2) {
+				    print $logfile $response_body;
+				}
+				$submitted++;
+			    } else {
+				print $logfile "last.fm scrobbling failed: ", $scrobblebody[0], "\n";
+				print STDERR "last.fm scrobbling failed: ", $scrobblebody[0], "\n";
+				if ($debug > 2) {
+				    print $logfile $response_body;
+				}
+				exit(1);
+			    }
+			} else {
+			    print $logfile "Received ".$response_code." from last.fm.\n";
+			    print STDERR "Received ".$response_code." from last.fm.\n";
+			    exit(1);
+			}
+		    } else {
+			print $logfile "An error happened while sending: $retcode ".$lfmcurl->strerror($retcode)." ".$lfmcurl->errbuf."\n";
+			print STDERR "An error happened while sending: $retcode ".$lfmcurl->strerror($retcode)." ".$lfmcurl->errbuf."\n";
+			exit(1);
+		    }
+		} else {
+		    if ($debug > 1) {
+			print $logfile "Same track, or not playing.\n";
+		    }
+		}
+	    }
+	} else {
+	    if ($debug > 1) {
+		print $logfile "Bad response received.\n";
+	    }
+	}
+    } else {
+	print $logfile "An error happened: $retcode ".$rcvcurl->strerror($retcode)." ".$rcvcurl->errbuf."\n";
+	print STDOUT "An error happened: $retcode ".$rcvcurl->strerror($retcode)." ".$rcvcurl->errbuf."\n";
+	exit(1);
+    }
+    sleep(10);
+}
